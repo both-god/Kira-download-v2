@@ -1,0 +1,997 @@
+import asyncio
+import csv
+import html
+import io
+import logging
+import os
+import re
+import secrets
+import shutil
+import time
+from datetime import datetime
+
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
+
+import config
+import db
+import downloader as dl
+import kb
+import userbot
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("bot")
+router = Router()
+esc = html.escape
+
+URLS, ACTIVE, TASKS = {}, {}, set()
+PREVIEWS, JOBMETA = {}, {}   # preview ផុសចូល Channel/Group · meta ឯកសារធំ
+SEM = asyncio.Semaphore(config.MAX_PARALLEL)
+
+DEFAULT_WELCOME = ("👋 សូមស្វាគមន៍មកកាន់ <b>Video Downloader Bot</b>\n\n"
+                   "📎 ផ្ញើតំណ YouTube, TikTok, Facebook, Instagram, Spotify... មកខ្ញុំ ដើម្បីទាញយក។\n"
+                   "🔑 ប្រើ Key ដើម្បីបន្ថែមចំនួនទាញយក។")
+DEFAULT_BUY = "🛒 ចង់ទិញ Key សូមទាក់ទងម្ចាស់ Bot។"
+
+REPLY_IDS = ["download", "redeem", "account", "buy", "history", "help", "admin", "a_create", "a_keys",
+             "a_del", "a_users", "a_stats", "a_cast", "a_ban", "a_unban", "a_credit", "a_colors",
+             "a_settings", "a_admins", "a_userbot", "a_ulist", "back"]
+LABELS = {kb.BUTTONS[i][0]: i for i in REPLY_IDS}
+
+PROMPTS = {
+    "redeem": "🔑 ផ្ញើ Key របស់អ្នកមក\nឧ. <code>KIRA ABCD EFGH JKLM</code>",
+    "create": "➕ ផ្ញើ៖ <code>ចំនួនទាញយក ចំនួនថ្ងៃ ចំនួន Key</code>\nឧ. <code>50 30 5</code> = 5 Key, Key មួយ 50 ដង, 30 ថ្ងៃ\n(ថ្ងៃ 0 = គ្មានកំណត់)",
+    "delkey": "🗑 ផ្ញើ Key ដែលចង់លុប",
+    "cast": "📢 ផ្ញើសារ (អត្ថបទ/រូប/វីដេអូ) ដែលចង់ផ្សាយទៅ User ទាំងអស់",
+    "ban": "🚫 ផ្ញើ User ID ដែលចង់ Ban",
+    "unban": "✅ ផ្ញើ User ID ដែលចង់ Unban",
+    "credit": "💎 ផ្ញើ៖ <code>user_id ចំនួន [ថ្ងៃ]</code>\nឧ. <code>123456789 20 30</code>",
+    "user": "👥 ផ្ញើ User ID",
+    "admin": "👮 ផ្ញើ៖ <code>add 123456</code> ឬ <code>del 123456</code> ឬ <code>list</code>",
+    "group": "👥 ផ្ញើ Group ID (ឧ. <code>-1001234567890</code>)\n⚠️ Userbot ត្រូវនៅក្នុង Group ហើយ Bot ត្រូវជា Admin",
+    "nubtoken": "🔑 ផ្ញើ NUB API Token (Bot នឹងលុបសារនេះចោលដោយស្វ័យប្រវត្តិ)",
+    "cookies": "🍪 ផ្ញើឯកសារ <b>cookies.txt</b> (Netscape format) ជាឯកសារ (File)",
+    "newchan": ("📢 ផ្ញើ <b>@username</b> ឬ <b>ID</b> (ឧ. <code>-1001234567890</code>) ឬ Link <code>t.me/name</code> របស់ Channel/Group\n"
+               "⚠️ ត្រូវដាក់ Bot ជា <b>Admin</b> (មានសិទ្ធិ Post Messages) ហើយអ្នកក៏ត្រូវជា Admin ក្នុងនោះដែរ\n"
+               "💡 រក ID ដោយផ្ញើ /myid ក្នុង Group"),
+    "free": "🎁 ផ្ញើចំនួន Free ក្នុងមួយថ្ងៃ (0 = បិទ)",
+    "welcome": "💬 ផ្ញើសារស្វាគមន៍ថ្មី (គាំទ្រ HTML)",
+    "buy": "🛒 ផ្ញើអត្ថបទទិញ Key ថ្មី (តម្លៃ, ទំនាក់ទំនង...)",
+    "ub_api": "🔐 ផ្ញើ <code>API_ID API_HASH</code> (ពី my.telegram.org)\nឧ. <code>1234567 0123456789abcdef0123456789abcdef</code>",
+    "ub_phone": "📱 ផ្ញើលេខទូរស័ព្ទគណនី Userbot ជាមួយលេខប្រទេស\nឧ. <code>+85512345678</code>",
+    "ub_code": "💬 Telegram បានផ្ញើកូដទៅគណនី Userbot។ ផ្ញើកូដមកទីនេះ <b>ដោយដាក់ដកឃ្លា ឬ - រវាងលេខ</b>\nឧ. <code>1 2 3 4 5</code>\n(បើផ្ញើជាប់គ្នា Telegram អាចបិទកូដ)",
+    "ub_pass": "🔑 គណនីមាន Two-Step Verification។ ផ្ញើពាក្យសម្ងាត់ (កូដទីពីរ)",
+}
+
+
+class Ask(StatesGroup):
+    input = State()
+
+
+def fmt_ts(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
+
+
+# ---------------- middleware ----------------
+class Guard(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        msg = event if isinstance(event, Message) else getattr(event, "message", None)
+        if not msg or msg.chat.type != "private" or not event.from_user:
+            return await handler(event, data)
+        u = event.from_user
+        await db.upsert_user(u)
+        if await db.is_admin(u.id):
+            return await handler(event, data)
+        row = await db.get_user(u.id)
+        if row["banned"]:
+            if isinstance(event, Message):
+                await event.answer("🚫 អ្នកត្រូវបានហាមឃាត់មិនឱ្យប្រើ Bot នេះ។")
+            return
+        if await db.get_setting("maint", "0") == "1":
+            if isinstance(event, Message):
+                await event.answer("🔧 Bot កំពុងថែទាំ សូមរង់ចាំបន្តិច។")
+            return
+        return await handler(event, data)
+
+
+router.message.outer_middleware(Guard())
+router.callback_query.outer_middleware(Guard())
+
+
+# ---------------- helpers ----------------
+async def ask(m: Message, state: FSMContext, act: str):
+    await state.set_state(Ask.input)
+    await state.update_data(act=act)
+    await m.answer(PROMPTS[act] + "\n\n/cancel — បោះបង់")
+
+
+async def account_text(uid):
+    q = await db.quota(uid)
+    exp = "គ្មានកំណត់" if q["expiry"] == 0 else fmt_ts(q["expiry"])
+    if q["expired"]:
+        exp += " (ផុតកំណត់ ⚠️)"
+    return (f"👤 <b>គណនីរបស់អ្នក</b>\n🆔 <code>{uid}</code>\n\n"
+            f"💎 ចំនួនទាញយកនៅសល់: <b>{q['credits']}</b>\n"
+            f"⏳ ផុតកំណត់: {exp}\n"
+            f"🎁 Free ថ្ងៃនេះ: {q['free_left']}/{q['free_total']}\n"
+            f"📥 ទាញយកសរុប: {q['total']}")
+
+
+async def no_credit_text():
+    return "⛔ អ្នកអស់ចំនួនទាញយក ឬ Key ផុតកំណត់\n\n" + await db.get_setting("buy_text", DEFAULT_BUY)
+
+
+async def settings_view():
+    g = await db.get_setting("group_id", str(config.BIG_GROUP_ID))
+    free = await db.get_setting("free_daily", "1")
+    maint = await db.get_setting("maint", "0") == "1"
+    delg = await db.get_setting("del_group", "0") == "1"
+    tok = await db.get_setting("nub_token", config.NUB_API_TOKEN)
+    txt = (f"⚙️ <b>ការកំណត់</b>\n\n🔑 NUB Token: {'✅' if tok else '❌ មិនទាន់ដាក់'}\n👥 Group ID: <code>{g or 'មិនទាន់កំណត់'}</code>\n"
+           f"🎁 Free/ថ្ងៃ: <b>{free}</b>\n🤖 Userbot: {'✅' if userbot.ready() else '❌'}")
+    return txt, kb.settings_kb(maint, delg)
+
+
+async def send_keys(m: Message, keys, head):
+    body = "\n".join(f"<code>{k}</code>" for k in keys)
+    if len(keys) <= 15:
+        await m.answer(f"{head}\n\n{body}")
+    else:
+        await m.answer(head)
+        await m.answer_document(BufferedInputFile("\n".join(keys).encode(), "keys.txt"))
+
+
+async def do_create(m: Message, text: str):
+    p = text.split()
+    if len(p) != 3 or not all(x.isdigit() for x in p):
+        return await m.answer("❌ ទម្រង់ខុស។ ឧ. <code>50 30 5</code>")
+    n, d, q = map(int, p)
+    if not (n >= 1 and 0 <= d <= 3650 and 1 <= q <= 500):
+        return await m.answer("❌ តម្លៃមិនត្រឹមត្រូវ (Key ≤ 500)")
+    keys = await db.create_keys(n, d, q, m.from_user.id)
+    await send_keys(m, keys, f"✅ បង្កើត <b>{q}</b> Key · {n} ដង · {d or '∞'} ថ្ងៃ")
+
+
+async def ub_status():
+    inf = await userbot.info()
+    g = await db.get_setting("group_id", str(config.BIG_GROUP_ID))
+    return ("🤖 <b>Userbot</b>\n\n" + (f"✅ ភ្ជាប់ហើយ: {esc(inf)}" if inf else "❌ មិនទាន់ភ្ជាប់")
+            + f"\n👥 Group ID: <code>{g or 'មិនទាន់កំណត់'}</code>")
+
+
+async def ub_done(m: Message):
+    inf = await userbot.info()
+    if not inf:
+        return await m.answer("❌ ភ្ជាប់មិនបាន សូមព្យាយាមម្តងទៀត")
+    g = int(await db.get_setting("group_id", str(config.BIG_GROUP_ID)) or 0)
+    extra = "⚠️ មិនទាន់កំណត់ Group ID"
+    if g:
+        ok, t = await userbot.check_group(g)
+        extra = f"👥 Group: {esc(str(t))[:80]}" if ok else f"⚠️ Userbot រក Group មិនឃើញ: {esc(str(t))[:120]}"
+    await m.answer(f"✅ <b>ភ្ជាប់ Userbot ជោគជ័យ</b>\n{esc(inf)}\n{extra}")
+
+
+async def ub_step(m: Message, state: FSMContext, act: str, text: str):
+    try:
+        await m.delete()  # លុបសារដែលមានកូដ/ពាក្យសម្ងាត់
+    except Exception:
+        pass
+    if act == "ub_api":
+        p = text.replace(",", " ").split()
+        if len(p) != 2 or not p[0].isdigit() or not re.fullmatch(r"[0-9a-fA-F]{32}", p[1]):
+            await m.answer("❌ ទម្រង់ខុស — API_ID ជាលេខ, API_HASH ត្រូវមាន 32 ខ្ទង់ (a-f, 0-9)")
+            return await ask(m, state, "ub_api")
+        await db.set_setting("ub_api_id", p[0])
+        await db.set_setting("ub_api_hash", p[1])
+        return await ask(m, state, "ub_phone")
+    if act == "ub_phone":
+        api_id, api_hash = await userbot.creds()
+        try:
+            await userbot.login_begin(api_id, api_hash, text.replace(" ", ""))
+        except Exception as e:
+            if "API_ID_INVALID" in str(e) or type(e).__name__ == "ApiIdInvalid":
+                await db.set_setting("ub_api_id", "0")
+                await db.set_setting("ub_api_hash", "")
+                await m.answer("❌ API_ID/API_HASH មិនត្រឹមត្រូវ សូមដាក់ម្តងទៀត (ចម្លងពី my.telegram.org)")
+                return await ask(m, state, "ub_api")
+            await m.answer(f"❌ {esc(str(e))[:250]}\nសូមផ្ញើលេខទូរស័ព្ទម្តងទៀត")
+            return await ask(m, state, "ub_phone")
+        return await ask(m, state, "ub_code")
+    if act == "ub_code":
+        try:
+            r = await userbot.login_code(re.sub(r"\D", "", text))
+        except Exception as e:
+            n = type(e).__name__
+            if n == "PhoneCodeInvalid":
+                await m.answer("❌ កូដខុស")
+                return await ask(m, state, "ub_code")
+            await userbot.login_cancel()
+            return await m.answer(f"❌ {n}: កូដផុតកំណត់ ឬមានបញ្ហា សូមចុចភ្ជាប់ម្តងទៀត")
+        if r == "password":
+            return await ask(m, state, "ub_pass")
+        return await ub_done(m)
+    if act == "ub_pass":
+        try:
+            await userbot.login_password(text)
+        except Exception:
+            await m.answer("❌ ពាក្យសម្ងាត់ខុស")
+            return await ask(m, state, "ub_pass")
+        await ub_done(m)
+
+
+# ---------------- commands ----------------
+@router.message(CommandStart(), F.chat.type == "private")
+async def start(m: Message, state: FSMContext):
+    await state.clear()
+    adm = await db.is_admin(m.from_user.id)
+    await m.answer(await db.get_setting("welcome", DEFAULT_WELCOME), reply_markup=kb.main_kb(adm))
+
+
+@router.message(Command("cancel"))
+async def cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await userbot.login_cancel()
+    await m.answer("❎ បានបោះបង់")
+
+
+@router.message(Command("myid"))
+async def myid(m: Message):
+    await m.answer(f"🆔 <code>{m.from_user.id}</code>\n💬 Chat: <code>{m.chat.id}</code>")
+
+
+@router.message(Command("redeem"), F.chat.type == "private")
+async def redeem_cmd(m: Message):
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("ប្រើ៖ <code>/redeem KEY</code>")
+    ok, msg = await db.redeem(m.from_user.id, parts[1])
+    await m.answer(msg)
+
+
+@router.message(Command("genkey"), F.chat.type == "private")
+async def genkey_cmd(m: Message):
+    if not await db.is_admin(m.from_user.id):
+        return
+    await do_create(m, (m.text or "").replace("/genkey", "", 1).strip())
+
+
+@router.message(Command("testapi"), F.chat.type == "private")
+async def testapi_cmd(m: Message):
+    if not await db.is_admin(m.from_user.id):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    url = parts[1] if len(parts) > 1 else "https://youtu.be/EHtxN9sORzI"
+    await m.answer("⏳ កំពុងសាកល្បង API...")
+    await m.answer(f"<pre>{esc(await dl.diagnose(url))[:3500]}</pre>")
+
+
+@router.message(Command("apiquota"), F.chat.type == "private")
+async def apiquota_cmd(m: Message):
+    if not await db.is_admin(m.from_user.id):
+        return
+    try:
+        await m.answer(f"<pre>{esc(await dl.api_quota())}</pre>")
+    except Exception as e:
+        await m.answer(f"❌ {esc(str(e))[:300]}")
+
+
+@router.message(Command("cookies"), F.chat.type == "private")
+async def cookies_cmd(m: Message, state: FSMContext):
+    if m.from_user.id != config.OWNER_ID:
+        return
+    await ask(m, state, "cookies")
+
+
+# ---------------- reply-keyboard menu ----------------
+@router.message(F.chat.type == "private", F.text.in_(LABELS))
+async def menu(m: Message, state: FSMContext):
+    await state.clear()
+    bid, uid = LABELS[m.text], m.from_user.id
+    adm = await db.is_admin(uid)
+    if (bid.startswith("a_") or bid == "admin") and not adm:
+        return
+    if bid == "download":
+        await m.answer("📎 ផ្ញើតំណវីដេអូ/តន្ត្រី (YouTube, TikTok, Facebook, Instagram, Spotify, SoundCloud...) មកខ្ញុំ")
+    elif bid == "redeem":
+        await ask(m, state, "redeem")
+    elif bid == "account":
+        await m.answer(await account_text(uid))
+    elif bid == "buy":
+        await m.answer(await db.get_setting("buy_text", DEFAULT_BUY))
+    elif bid == "history":
+        rows = await db.last_history(uid)
+        if not rows:
+            return await m.answer("📜 មិនទាន់មានប្រវត្តិ")
+        ic = {"ok": "✅", "fail": "❌", "pending": "⏳"}
+        await m.answer("📜 <b>ប្រវត្តិ ១០ ចុងក្រោយ</b>\n\n" + "\n".join(
+            f"{ic.get(r['status'], '•')} {esc(r['title'] or r['url'])[:50]} · {r['kind']} · {fmt_ts(r['ts'])}" for r in rows))
+    elif bid == "help":
+        await m.answer("ℹ️ <b>របៀបប្រើ</b>\n1️⃣ ផ្ញើតំណវីដេអូ\n2️⃣ ជ្រើស វីដេអូ ឬ អូឌីយ៉ូ\n"
+                       "3️⃣ រង់ចាំទទួលឯកសារ\n\n🔑 អស់ចំនួន? ទិញ Key រួចចុច «ដាក់ Key»\n📦 គាំទ្រឯកសារធំដល់ 2GB")
+    elif bid == "admin":
+        await m.answer("🛠 <b>Admin Panel</b>", reply_markup=kb.admin_kb())
+    elif bid == "back":
+        await m.answer("🏠 មឺនុយមេ", reply_markup=kb.main_kb(adm))
+    elif bid == "a_create":
+        await ask(m, state, "create")
+    elif bid == "a_keys":
+        rows = await db.list_keys(True)
+        if not rows:
+            return await m.answer("📋 មិនមាន Key ទំនេរ")
+        lines = [f"{r['key']} | {r['credits']} ដង | {r['days'] or '∞'} ថ្ងៃ" for r in rows]
+        if len(lines) <= 15:
+            await m.answer(f"📋 Key ទំនេរ: <b>{len(lines)}</b>\n\n" + "\n".join(f"<code>{l}</code>" for l in lines))
+        else:
+            await m.answer_document(BufferedInputFile("\n".join(lines).encode(), "keys_unused.txt"),
+                                    caption=f"📋 Key ទំនេរ: {len(lines)}")
+    elif bid == "a_del":
+        await ask(m, state, "delkey")
+    elif bid == "a_users":
+        await ask(m, state, "user")
+    elif bid == "a_ulist":
+        t, k = await users_view(1)
+        await m.answer(t, reply_markup=k)
+    elif bid == "a_stats":
+        s = await db.stats()
+        await m.answer(f"📊 <b>ស្ថិតិ</b>\n\n👥 User: {s['users']} (Ban {s['banned']})\n💎 User សកម្ម: {s['active']}\n"
+                       f"🔑 Key ទំនេរ: {s['keys_free']} · ប្រើរួច: {s['keys_used']}\n"
+                       f"📥 ទាញយក: {s['dl_all']} (24h: {s['dl_day']}) · បរាជ័យ: {s['fail']}")
+    elif bid == "a_cast":
+        await ask(m, state, "cast")
+    elif bid in ("a_ban", "a_unban"):
+        await ask(m, state, "ban" if bid == "a_ban" else "unban")
+    elif bid == "a_credit":
+        await ask(m, state, "credit")
+    elif bid == "a_colors":
+        await m.answer("🎨 <b>កំណត់ពណ៌ប៊ូតុង</b>\nចុចប៊ូតុងដែលចង់ប្តូរ រួចជ្រើសពណ៌ (ក្រហម/ខៀវ/បៃតង)។",
+                       reply_markup=kb.colors_kb())
+    elif bid == "a_settings":
+        t, k = await settings_view()
+        await m.answer(t, reply_markup=k)
+    elif bid == "a_admins":
+        if uid != config.OWNER_ID:
+            return await m.answer("⛔ សម្រាប់ម្ចាស់ Bot ប៉ុណ្ណោះ")
+        await ask(m, state, "admin")
+    elif bid == "a_userbot":
+        if uid != config.OWNER_ID:
+            return await m.answer("⛔ សម្រាប់ម្ចាស់ Bot ប៉ុណ្ណោះ")
+        await m.answer(await ub_status(), reply_markup=kb.ub_kb())
+
+
+# ---------------- admin: បញ្ជី User ទាំងអស់ ----------------
+USERS_PER_PAGE = 15
+
+
+async def users_view(page):
+    total = await db.count_users()
+    pages = max(1, (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+    page = min(max(page, 1), pages)
+    rows = await db.users_page((page - 1) * USERS_PER_PAGE, USERS_PER_PAGE)
+    lines = []
+    for i, r in enumerate(rows, (page - 1) * USERS_PER_PAGE + 1):
+        un = f"@{esc(r['username'])}" if r["username"] else "-"
+        lines.append(f"{i}. {'🚫 ' if r['banned'] else ''}<b>{esc(r['name'] or '-')}</b> · {un} · <code>{r['id']}</code>")
+    text = f"📃 <b>បញ្ជី User ទាំងអស់</b> ({total})\n\n" + ("\n".join(lines) or "មិនទាន់មាន User")
+    return text, kb.users_kb(page, pages)
+
+
+def _csv_safe(v):
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@") else v
+
+
+def users_csv(rows):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "name", "username", "credits", "banned", "total_downloads", "joined"])
+    for r in rows:
+        w.writerow([r["id"], _csv_safe(r["name"]), r["username"] or "",
+                    r["credits"], r["banned"], r["total"], fmt_ts(r["joined"])])
+    return buf.getvalue().encode("utf-8-sig")  # BOM ដើម្បីឱ្យ Excel អានខ្មែរបាន
+
+
+@router.callback_query(F.data.startswith("ul:"))
+async def ul_cb(cb: CallbackQuery):
+    if not await db.is_admin(cb.from_user.id):
+        return await cb.answer()
+    arg = cb.data.split(":")[1]
+    if arg == "noop":
+        return await cb.answer()
+    if arg == "csv":
+        rows = await db.all_users()
+        await cb.answer()
+        return await cb.message.answer_document(
+            BufferedInputFile(users_csv(rows), f"users_{datetime.now():%Y%m%d_%H%M}.csv"),
+            caption=f"👥 User ទាំងអស់: {len(rows)}")
+    t, k = await users_view(int(arg))
+    await cb.answer()
+    try:
+        await cb.message.edit_text(t, reply_markup=k)
+    except TelegramBadRequest:
+        pass
+
+
+# ---------------- FSM input ----------------
+@router.message(Ask.input, F.chat.type == "private")
+async def ask_input(m: Message, state: FSMContext):
+    data = await state.get_data()
+    act = data.get("act")
+    text = (m.text or m.caption or "").strip()
+    uid = m.from_user.id
+    await state.clear()
+    adm = await db.is_admin(uid)
+    if act == "newchan":
+        return await newchan_step(m, state, uid, text, data.get("tok"))
+    if act == "caption":
+        return await caption_step(m, state, uid, data.get("ptok"))
+    if act and act.startswith("ub_"):
+        if uid != config.OWNER_ID:
+            return
+        return await ub_step(m, state, act, text)
+    if act != "redeem" and not adm:
+        return
+    if act == "redeem":
+        ok, msg = await db.redeem(uid, text)
+        await m.answer(msg)
+    elif act == "create":
+        await do_create(m, text)
+    elif act == "delkey":
+        await m.answer("✅ លុបរួច" if await db.delete_key(text) else "❌ រកមិនឃើញ Key")
+    elif act == "cast":
+        ids = await db.all_user_ids()
+        st = await m.answer(f"📢 កំពុងផ្ញើ 0/{len(ids)}")
+        ok = fail = 0
+        for i, u in enumerate(ids, 1):
+            for _ in range(2):
+                try:
+                    await m.copy_to(u)
+                    ok += 1
+                    break
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                except Exception:
+                    fail += 1
+                    break
+            if i % 25 == 0:
+                try:
+                    await st.edit_text(f"📢 កំពុងផ្ញើ {i}/{len(ids)}")
+                except Exception:
+                    pass
+            await asyncio.sleep(0.05)
+        await st.edit_text(f"📢 រួចរាល់ ✅ {ok} · ❌ {fail}")
+    elif act in ("ban", "unban"):
+        if not text.lstrip("-").isdigit():
+            return await m.answer("❌ User ID មិនត្រឹមត្រូវ")
+        if act == "ban" and int(text) == config.OWNER_ID:
+            return await m.answer("❌ មិនអាច Ban ម្ចាស់បាន")
+        ok = await db.set_ban(int(text), act == "ban")
+        await m.answer(("🚫 Ban រួច" if act == "ban" else "✅ Unban រួច") if ok else "❌ រកមិនឃើញ User")
+    elif act == "credit":
+        p = text.split()
+        if len(p) not in (2, 3) or not all(x.isdigit() for x in p):
+            return await m.answer("❌ ទម្រង់ខុស")
+        ok = await db.add_credits(int(p[0]), int(p[1]), int(p[2]) if len(p) == 3 else 0)
+        await m.answer("✅ បានបន្ថែម" if ok else "❌ រកមិនឃើញ User")
+        if ok:
+            try:
+                await m.bot.send_message(int(p[0]), f"🎁 អ្នកទទួលបាន <b>{p[1]}</b> ដងទាញយកថ្មី!")
+            except Exception:
+                pass
+    elif act == "user":
+        u = await db.get_user(int(text)) if text.isdigit() else None
+        if not u:
+            return await m.answer("❌ រកមិនឃើញ User")
+        q = await db.quota(u["id"])
+        await m.answer(f"👤 <b>{esc(u['name'] or '')}</b> @{esc(u['username'] or '-')}\n🆔 <code>{u['id']}</code>\n"
+                       f"💎 {q['credits']} ដង · ផុត: {fmt_ts(u['expiry']) if u['expiry'] else '∞'}\n"
+                       f"📥 សរុប: {u['total']} · Ban: {'បាទ' if u['banned'] else 'ទេ'}\n📅 ចូល: {fmt_ts(u['joined'])}")
+    elif act == "admin":
+        p = text.split()
+        if uid != config.OWNER_ID:
+            return
+        if p and p[0] == "list":
+            ids = await db.list_admins()
+            return await m.answer("👮 Admin៖\n" + ("\n".join(f"<code>{i}</code>" for i in ids) or "គ្មាន"))
+        if len(p) == 2 and p[0] in ("add", "del") and p[1].isdigit():
+            await (db.add_admin if p[0] == "add" else db.del_admin)(int(p[1]))
+            return await m.answer("✅ រួចរាល់")
+        await m.answer("❌ ទម្រង់ខុស")
+    elif act == "nubtoken":
+        try:
+            await m.delete()
+        except Exception:
+            pass
+        if uid != config.OWNER_ID or len(text) < 6:
+            return await m.answer("❌ Token មិនត្រឹមត្រូវ (ម្ចាស់ Bot ប៉ុណ្ណោះ)")
+        await db.set_setting("nub_token", text)
+        await m.answer("✅ បានរក្សាទុក NUB API Token")
+    elif act == "cookies":
+        if uid != config.OWNER_ID or not m.document:
+            return await m.answer("❌ សូមផ្ញើជាឯកសារ (File) .txt")
+        await m.bot.download(m.document, destination=dl.cookies_path())
+        try:
+            await m.delete()
+        except Exception:
+            pass
+        await m.answer("✅ បានរក្សាទុក cookies")
+    elif act == "group":
+        if not text.lstrip("-").isdigit():
+            return await m.answer("❌ Group ID មិនត្រឹមត្រូវ")
+        await db.set_setting("group_id", text)
+        await m.answer(f"✅ Group ID = <code>{text}</code>")
+    elif act == "free":
+        if not text.isdigit():
+            return await m.answer("❌ ត្រូវតែជាលេខ")
+        await db.set_setting("free_daily", text)
+        await m.answer("✅ រួចរាល់")
+    elif act in ("welcome", "buy"):
+        await db.set_setting("welcome" if act == "welcome" else "buy_text", m.html_text or text)
+        await m.answer("✅ រួចរាល់")
+
+
+# ---------------- settings / colors callbacks ----------------
+@router.callback_query(F.data.startswith(("set:", "tog:", "col", "setcol:", "setall:", "ub:")))
+async def admin_cb(cb: CallbackQuery, state: FSMContext):
+    if not await db.is_admin(cb.from_user.id):
+        return await cb.answer("⛔", show_alert=True)
+    d = cb.data
+    if d.startswith("ub:"):
+        if cb.from_user.id != config.OWNER_ID:
+            return await cb.answer("⛔ ម្ចាស់ Bot ប៉ុណ្ណោះ", show_alert=True)
+        act = d[3:]
+        if act == "connect":
+            api_id, api_hash = await userbot.creds()
+            await cb.answer()
+            return await ask(cb.message, state, "ub_phone" if (api_id and api_hash) else "ub_api")
+        if act == "api":
+            await cb.answer()
+            return await ask(cb.message, state, "ub_api")
+        if act == "off":
+            await userbot.logout()
+            await cb.message.edit_text(await ub_status(), reply_markup=kb.ub_kb())
+            return await cb.answer("🔌 ផ្តាច់រួច")
+        if act == "test":
+            g = int(await db.get_setting("group_id", str(config.BIG_GROUP_ID)) or 0)
+            if not userbot.ready() or not g:
+                return await cb.answer("❌ Userbot ឬ Group ID មិនទាន់កំណត់", show_alert=True)
+            ok, t = await userbot.check_group(g)
+            return await cb.answer(("✅ " if ok else "❌ ") + str(t)[:150], show_alert=True)
+    if d.startswith("set:"):
+        act = d[4:]
+        await state.set_state(Ask.input)
+        await state.update_data(act=act)
+        await cb.message.answer(PROMPTS[act] + "\n\n/cancel — បោះបង់")
+        return await cb.answer()
+    if d.startswith("tog:"):
+        key = "maint" if d == "tog:maint" else "del_group"
+        cur = await db.get_setting(key, "0")
+        await db.set_setting(key, "0" if cur == "1" else "1")
+        t, k = await settings_view()
+        await cb.message.edit_text(t, reply_markup=k)
+        return await cb.answer("✅")
+    if d.startswith("col:"):
+        bid = d[4:]
+        cur = kb.COLORS.get(bid, "none")
+        await cb.message.edit_text(f"🎨 {kb.BUTTONS[bid][0]}\nពណ៌បច្ចុប្បន្ន: {kb.EMOJI[cur]} {kb.NAMES[cur]}",
+                                   reply_markup=kb.pick_color_kb(bid))
+        return await cb.answer()
+    if d == "colall":
+        await cb.message.edit_text("🌈 <b>ជ្រើសពណ៌ សម្រាប់ប៊ូតុងទាំងអស់</b>", reply_markup=kb.pick_all_kb())
+        return await cb.answer()
+    if d.startswith("setall:"):
+        c = d.split(":")[1]
+        for bid in kb.BUTTONS:
+            await kb.set_color(bid, c)
+        await cb.message.edit_text("🎨 <b>កំណត់ពណ៌ប៊ូតុង</b>", reply_markup=kb.colors_kb())
+        await cb.message.answer(f"✅ ប៊ូតុងទាំងអស់ → {kb.EMOJI[c]} {kb.NAMES[c]}", reply_markup=kb.admin_kb())
+        return await cb.answer()
+    if d == "colback":
+        await cb.message.edit_text("🎨 <b>កំណត់ពណ៌ប៊ូតុង</b>", reply_markup=kb.colors_kb())
+        return await cb.answer()
+    if d == "colreset":
+        await kb.reset_colors()
+        await cb.message.edit_text("🎨 <b>កំណត់ពណ៌ប៊ូតុង</b>", reply_markup=kb.colors_kb())
+        await cb.message.answer("✅ កំណត់ពណ៌ដើមវិញ", reply_markup=kb.admin_kb())
+        return await cb.answer()
+    if d.startswith("setcol:"):
+        _, bid, c = d.split(":")
+        await kb.set_color(bid, c)
+        await cb.message.edit_text("🎨 <b>កំណត់ពណ៌ប៊ូតុង</b>", reply_markup=kb.colors_kb())
+        await cb.message.answer(f"✅ {kb.BUTTONS[bid][0]} → {kb.EMOJI[c]} {kb.NAMES[c]}", reply_markup=kb.admin_kb())
+        return await cb.answer()
+
+
+# ---------------- download flow ----------------
+@router.message(F.chat.type == "private", F.text.regexp(r"https?://\S+"))
+async def got_url(m: Message):
+    url = re.search(r"https?://\S+", m.text).group(0)
+    if len(URLS) > 500:
+        URLS.clear()
+    tok = secrets.token_hex(4)
+    URLS[tok] = (m.from_user.id, url)
+    await m.reply("🎯 ជ្រើសប្រភេទ៖", reply_markup=kb.kind_kb(tok))
+
+
+@router.callback_query(F.data.startswith("dl:"))
+async def dl_cb(cb: CallbackQuery):
+    _, kind, tok = cb.data.split(":")
+    item = URLS.get(tok)
+    if not item or item[0] != cb.from_user.id:
+        return await cb.answer("⌛ អស់សុពលភាព សូមផ្ញើតំណម្តងទៀត", show_alert=True)
+    if kind == "cancel":
+        URLS.pop(tok, None)
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+        return await cb.answer()
+    URLS[tok] = (item[0], item[1], kind)          # ចាំប្រភេទ (video/audio) រួចជ្រើសទីតាំង
+    chans = await db.list_channels(cb.from_user.id)
+    await cb.answer()
+    try:
+        await cb.message.edit_text("📍 ជ្រើសទីតាំងទទួល៖", reply_markup=kb.dest_kb(tok, chans))
+    except Exception:
+        pass
+
+
+def start_job(bot, chat_id, uid, url, kind, dest=None, dest_title=None):
+    t = asyncio.create_task(process(bot, chat_id, uid, url, kind, dest, dest_title))
+    TASKS.add(t)
+    t.add_done_callback(TASKS.discard)
+
+
+# ---------------- destination: private / channel / group ----------------
+def parse_chat_ref(text):
+    parts = (text or "").strip().split()
+    if not parts:
+        return None
+    t = parts[0]
+    if re.fullmatch(r"-\d{5,}", t):
+        return int(t)
+    m = re.search(r"t\.me/c/(\d+)", t)
+    if m:
+        return int("-100" + m.group(1))
+    m = re.search(r"(?:https?://)?(?:t|telegram)\.me/([A-Za-z][A-Za-z0-9_]{3,})", t)
+    if m and m.group(1).lower() != "joinchat":
+        return "@" + m.group(1)
+    if re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,31}", t):
+        return "@" + t.lstrip("@")
+    return None
+
+
+async def check_target(bot: Bot, ref, uid):
+    """Bot ត្រូវជា Admin (post បាន) ហើយអ្នកប្រើក៏ត្រូវជា Admin ក្នុង Channel/Group នោះ។"""
+    try:
+        chat = await bot.get_chat(ref)
+    except Exception:
+        return None, "❌ រក Channel/Group មិនឃើញ។ ពិនិត្យ @username/ID ហើយដាក់ Bot ជា Admin ជាមុន"
+    if chat.type not in ("channel", "group", "supergroup"):
+        return None, "❌ ត្រូវតែជា Channel ឬ Group"
+    me = await bot.me()
+    try:
+        bm = await bot.get_chat_member(chat.id, me.id)
+    except Exception:
+        return None, "❌ Bot មិនទាន់ជា Admin ក្នុង Channel/Group នោះទេ"
+    if bm.status not in ("administrator", "creator"):
+        return None, "❌ Bot មិនទាន់ជា Admin ក្នុង Channel/Group នោះទេ"
+    if chat.type == "channel" and getattr(bm, "can_post_messages", True) is False:
+        return None, "❌ Bot គ្មានសិទ្ធិ Post Messages ក្នុង Channel នោះ"
+    try:
+        um = await bot.get_chat_member(chat.id, uid)
+    except Exception:
+        return None, "❌ មិនអាចផ្ទៀងផ្ទាត់ថាអ្នកជា Admin បាន"
+    if um.status not in ("administrator", "creator"):
+        return None, "❌ អ្នកត្រូវតែជា Admin ក្នុង Channel/Group នោះ"
+    return chat, None
+
+
+async def ask_newchan(m: Message, state: FSMContext, tok):
+    await state.set_state(Ask.input)
+    await state.update_data(act="newchan", tok=tok)
+    await m.answer(PROMPTS["newchan"] + "\n\n/cancel — បោះបង់")
+
+
+async def newchan_step(m: Message, state: FSMContext, uid, text, tok):
+    ref = parse_chat_ref(text)
+    if ref is None:
+        await m.answer("❌ ទម្រង់មិនត្រឹមត្រូវ។ ផ្ញើ @username, ID (-100...) ឬ Link t.me/username "
+                       "(Link ឯកជន t.me/+... មិនគាំទ្រ)")
+        return await ask_newchan(m, state, tok)
+    chat, err = await check_target(m.bot, ref, uid)
+    if err:
+        await m.answer(err)
+        return await ask_newchan(m, state, tok)
+    await db.add_channel(uid, chat.id, chat.title or str(chat.id), chat.username or "")
+    item = URLS.pop(tok, None) if tok else None
+    if not item or item[0] != uid or len(item) < 3:
+        return await m.answer(f"✅ បានរក្សាទុក <b>{esc(chat.title or '')}</b> · សូមផ្ញើតំណវីដេអូម្តងទៀត")
+    await m.answer(f"✅ បានរក្សាទុក <b>{esc(chat.title or '')}</b>")
+    start_job(m.bot, m.chat.id, uid, item[1], item[2], chat.id, chat.title or str(chat.id))
+
+
+@router.callback_query(F.data.startswith("dst:"))
+async def dst_cb(cb: CallbackQuery, state: FSMContext):
+    parts = cb.data.split(":")
+    act, tok = parts[1], parts[2]
+    uid = cb.from_user.id
+    item = URLS.get(tok)
+    if not item or item[0] != uid or len(item) < 3:
+        return await cb.answer("⌛ អស់សុពលភាព សូមផ្ញើតំណម្តងទៀត", show_alert=True)
+    if act == "me":
+        URLS.pop(tok, None)
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+        await cb.answer()
+        return start_job(cb.bot, cb.message.chat.id, uid, item[1], item[2])
+    if act == "new":
+        await cb.answer()
+        return await ask_newchan(cb.message, state, tok)
+    chat_id = int(parts[3])
+    if not await db.has_channel(uid, chat_id):
+        return await cb.answer("❌ រកមិនឃើញក្នុងបញ្ជី", show_alert=True)
+    if act == "x":
+        await db.del_channel(uid, chat_id)
+        await cb.answer("🗑 បានលុប")
+        try:
+            await cb.message.edit_reply_markup(reply_markup=kb.dest_kb(tok, await db.list_channels(uid)))
+        except Exception:
+            pass
+        return
+    if act == "c":
+        chat, err = await check_target(cb.bot, chat_id, uid)
+        if err:
+            return await cb.answer(err[:190], show_alert=True)
+        URLS.pop(tok, None)
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+        await cb.answer()
+        start_job(cb.bot, cb.message.chat.id, uid, item[1], item[2], chat.id, chat.title or str(chat.id))
+
+
+# ---------------- preview → edit caption → post ----------------
+def add_preview(ptok, uid, msg_id, dest, dest_title, title, cap, kind):
+    while len(PREVIEWS) > 300:
+        PREVIEWS.pop(next(iter(PREVIEWS)))
+    PREVIEWS[ptok] = {"uid": uid, "msg": msg_id, "dest": dest, "dest_title": dest_title,
+                      "title": title, "cap": cap, "kind": kind, "busy": False}
+
+
+async def caption_step(m: Message, state: FSMContext, uid, ptok):
+    pv = PREVIEWS.get(ptok)
+    if not pv or pv["uid"] != uid:
+        return await m.answer("⌛ អស់សុពលភាព សូមទាញយកម្តងទៀត")
+    new = (m.html_text or "").strip().replace("{title}", esc(pv["title"]))
+    plain = html.unescape(re.sub(r"<[^>]+>", "", new))
+    if not plain or len(plain) > 1024:
+        await m.answer("❌ អត្ថបទត្រូវមាន 1–1024 តួអក្សរ")
+        await state.set_state(Ask.input)
+        await state.update_data(act="caption", ptok=ptok)
+        return
+    try:
+        await m.bot.edit_message_caption(chat_id=uid, message_id=pv["msg"], caption=new,
+                                         parse_mode=ParseMode.HTML,
+                                         reply_markup=kb.preview_kb(ptok, pv["dest_title"]))
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e).lower():
+            await m.answer(f"❌ កែមិនបាន: {esc(str(e))[:200]}\nសូមផ្ញើម្តងទៀត")
+            await state.set_state(Ask.input)
+            await state.update_data(act="caption", ptok=ptok)
+            return
+    pv["cap"] = new
+    await m.answer("✅ បានកែអត្ថបទ — ពិនិត្យ File ខាងលើ ហើយចុច 📤 ផុសចូល")
+
+
+@router.callback_query(F.data.startswith("pv:"))
+async def pv_cb(cb: CallbackQuery, state: FSMContext):
+    _, act, ptok = cb.data.split(":")
+    uid = cb.from_user.id
+    pv = PREVIEWS.get(ptok)
+    if not pv or pv["uid"] != uid:
+        return await cb.answer("⌛ អស់សុពលភាព", show_alert=True)
+    if act == "cancel":
+        PREVIEWS.pop(ptok, None)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return await cb.answer("❎ បានបោះបង់ការផុស")
+    if act == "edit":
+        await cb.answer()
+        await state.set_state(Ask.input)
+        await state.update_data(act="caption", ptok=ptok)
+        return await cb.message.answer(
+            "✏️ ផ្ញើអត្ថបទថ្មីសម្រាប់ដាក់ក្រោម File (អាចប្រើ Bold/Italic/Link តាម Format របស់ Telegram)\n"
+            "💡 ដាក់ <code>{title}</code> ដើម្បីបញ្ចូលចំណងជើងដើម\n\n"
+            "អត្ថបទបច្ចុប្បន្ន៖\n" + pv["cap"] + "\n\n/cancel — បោះបង់")
+    if act == "post":
+        if pv["busy"]:
+            return await cb.answer("⏳ កំពុងផុស...")
+        pv["busy"] = True
+        try:
+            chat, err = await check_target(cb.bot, pv["dest"], uid)
+            if err:
+                return await cb.answer(err[:190], show_alert=True)
+            r = await cb.bot.copy_message(chat_id=chat.id, from_chat_id=uid, message_id=pv["msg"],
+                                          caption=pv["cap"], parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.exception("post failed")
+            return await cb.answer(f"❌ ផុសមិនបាន: {str(e)[:150]}", show_alert=True)
+        finally:
+            pv["busy"] = False
+        PREVIEWS.pop(ptok, None)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        link = ""
+        if chat.username:
+            link = f"\nhttps://t.me/{chat.username}/{r.message_id}"
+        elif str(chat.id).startswith("-100"):
+            link = f"\nhttps://t.me/c/{str(chat.id)[4:]}/{r.message_id}"
+        await cb.answer("✅ បានផុសរួចរាល់")
+        await cb.message.answer(f"✅ បានផុសចូល <b>{esc(chat.title or '')}</b>{link}")
+
+
+async def process(bot: Bot, chat_id, uid, url, kind, dest=None, dest_title=None):
+    if ACTIVE.get(uid, 0) >= 2:
+        return await bot.send_message(chat_id, "⏳ សូមរង់ចាំការទាញយកមុនបញ្ចប់សិន")
+    src = await db.consume(uid)
+    if not src:
+        return await bot.send_message(chat_id, await no_credit_text())
+    ACTIVE[uid] = ACTIVE.get(uid, 0) + 1
+    hid = await db.add_history(uid, url, kind)
+    st = await bot.send_message(chat_id, "⏳ កំពុងរៀបចំ...")
+    jobdir = os.path.join(config.DOWNLOAD_DIR, secrets.token_hex(6))
+
+    async def progress(done, total):
+        pct = f" {done * 100 // total}%" if total else f" {done >> 20}MB"
+        try:
+            await st.edit_text(f"⬇️ កំពុងទាញយក{pct}")
+        except Exception:
+            pass
+
+    try:
+        async with SEM:
+            await st.edit_text("⬇️ កំពុងទាញយក...")
+            res = await dl.fetch(url, kind, jobdir, progress)
+        title, path = res["title"], res["path"]
+        size = os.path.getsize(path)
+        if size <= config.BOT_UPLOAD_LIMIT:
+            await st.edit_text("📤 កំពុងផ្ញើ...")
+            cap = f"{'🎵' if kind == 'audio' else '🎬'} {esc(title)}"[:1000]
+            f = FSInputFile(path)
+            th = FSInputFile(res["thumb"]) if res.get("thumb") else None
+            ptok, markup = None, None
+            if dest:  # ទៅ Channel/Group → បង្ហាញ preview ឱ្យកែអត្ថបទមុនផុស
+                ptok = secrets.token_hex(4)
+                markup = kb.preview_kb(ptok, dest_title)
+            try:
+                if kind == "audio":
+                    sent = await bot.send_audio(chat_id, f, caption=cap, title=title[:60],
+                                                duration=res["duration"], thumbnail=th, reply_markup=markup)
+                else:
+                    sent = await bot.send_video(chat_id, f, caption=cap, duration=res["duration"],
+                                                width=res["width"], height=res["height"],
+                                                supports_streaming=True, thumbnail=th, reply_markup=markup)
+            except Exception:
+                sent = await bot.send_document(chat_id, FSInputFile(path), caption=cap, reply_markup=markup)
+            await db.finish_history(hid, "ok", title)
+            if dest:
+                add_preview(ptok, uid, sent.message_id, dest, dest_title, title, cap, kind)
+                await st.edit_text("👆 ពិនិត្យ File ខាងលើ — ✏️ កែអត្ថបទបាន មុនចុច 📤 ផុសចូល")
+            else:
+                await st.delete()
+        else:
+            group = int(await db.get_setting("group_id", str(config.BIG_GROUP_ID)) or 0)
+            if not group or not userbot.ready():
+                raise RuntimeError("ឯកសារធំជាង 50MB ហើយ Userbot/Group មិនទាន់កំណត់")
+            req = secrets.token_hex(6)
+            await db.add_pending(req, uid, hid, src)
+            await db.finish_history(hid, "pending", title)
+            await st.edit_text(f"📦 ឯកសារធំ ({size >> 20}MB) · Userbot កំពុងអាប់ឡូត...")
+            if dest:
+                JOBMETA[req] = {"dest": dest, "dest_title": dest_title, "kind": kind, "title": title}
+            try:
+                await userbot.upload(group, path, f"REQ:{req}\n{cap_title(title, kind)}", kind, res)
+            except Exception:
+                await db.pop_pending(req)
+                JOBMETA.pop(req, None)
+                raise
+            t = asyncio.create_task(watchdog(bot, req, chat_id))
+            TASKS.add(t)
+            t.add_done_callback(TASKS.discard)
+    except Exception as e:
+        log.exception("download failed")
+        await db.refund(uid, src)
+        await db.finish_history(hid, "fail")
+        try:
+            await st.edit_text(f"❌ បរាជ័យ: {esc(str(e))[:600]}\n(ចំនួនទាញយកត្រូវបានសងវិញ)")
+        except Exception:
+            pass
+    finally:
+        ACTIVE[uid] = max(0, ACTIVE.get(uid, 1) - 1)
+        shutil.rmtree(jobdir, ignore_errors=True)
+
+
+def cap_title(title, kind):
+    return f"{'🎵' if kind == 'audio' else '🎬'} {esc(title)}"[:900]
+
+
+async def watchdog(bot: Bot, req, chat_id):
+    await asyncio.sleep(180)
+    p = await db.pop_pending(req)
+    JOBMETA.pop(req, None)
+    if not p:
+        return
+    await db.refund(p["user_id"], p["src"])
+    await db.finish_history(p["hist_id"], "fail")
+    try:
+        await bot.send_message(chat_id, "❌ ផ្ញើឯកសារធំមិនបាន ចំនួនទាញយកត្រូវបានសងវិញ។")
+        await bot.send_message(config.OWNER_ID, "⚠️ Bot មិនបានទទួលឯកសារពី Group។ សូមពិនិត្យថា Bot ជា Admin ក្នុង Group ហើយ Group ID ត្រឹមត្រូវ។")
+    except Exception:
+        pass
+
+
+# ---------------- big-file pickup from group ----------------
+@router.message(F.chat.type.in_({"group", "supergroup"}), F.caption.startswith("REQ:"))
+async def group_pick(m: Message):
+    gid = int(await db.get_setting("group_id", str(config.BIG_GROUP_ID)) or 0)
+    if m.chat.id != gid:
+        return
+    mt = re.match(r"REQ:([0-9a-f]+)", m.caption)
+    p = await db.pop_pending(mt.group(1)) if mt else None
+    if not p:
+        return
+    cap = m.caption.split("\n", 1)[1] if "\n" in m.caption else ""
+    meta = JOBMETA.pop(mt.group(1), None)
+    try:
+        ptok, markup = None, None
+        if meta:  # ទៅ Channel/Group → ផ្ញើ preview ឱ្យ User កែអត្ថបទមុនផុស
+            ptok = secrets.token_hex(4)
+            markup = kb.preview_kb(ptok, meta["dest_title"])
+        r = await m.bot.copy_message(p["user_id"], m.chat.id, m.message_id, caption=cap,
+                                     parse_mode=ParseMode.HTML, reply_markup=markup)
+        if meta:
+            add_preview(ptok, p["user_id"], r.message_id, meta["dest"], meta["dest_title"],
+                        meta["title"], cap, meta["kind"])
+            await m.bot.send_message(p["user_id"], "👆 ពិនិត្យ File ខាងលើ — ✏️ កែអត្ថបទបាន មុនចុច 📤 ផុសចូល")
+        await db.finish_history(p["hist_id"], "ok")
+        if await db.get_setting("del_group", "0") == "1":
+            await m.delete()
+    except Exception as e:
+        log.exception("copy failed")
+        await db.refund(p["user_id"], p["src"])
+        await db.finish_history(p["hist_id"], "fail")
+        await m.bot.send_message(p["user_id"], f"❌ ផ្ញើមិនបាន: {esc(str(e))[:200]}")
+
+
+# ---------------- main ----------------
+async def main():
+    if not config.BOT_TOKEN:
+        raise SystemExit("សូមដាក់ BOT_TOKEN ក្នុង .env")
+    os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
+    await db.init()
+    await kb.load_colors()
+    bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    await userbot.start()
+    try:
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    finally:
+        await userbot.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
